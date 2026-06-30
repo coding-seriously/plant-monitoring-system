@@ -377,12 +377,12 @@ The dashboard includes:
 
 # 👥 Team
 
+- **Pratham Warpa**
+- **Pratyush Ranjan**
 - **Saqulain Haidar**
-- **Shaurya Verma**
 - **Shivam Kumar**
 - **Yash Jiyani**
-- **Zeeshan Rather**
-
+  
 ---
 
 # 📜 License
