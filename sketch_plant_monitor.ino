@@ -1,3 +1,5 @@
+#include <DHTesp.h>
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DHTesp.h>                // ✅ BeeGee Tokyo DHT Library
@@ -28,12 +30,16 @@ DHTesp dht;
 WebServer server(80);
 
 // ===== Calibration & Control Parameters =====
-const int SOIL_DRY = 3500;
-const int SOIL_WET = 1000;
-const int soilThresholdPercent = 30;
+const int SOIL_DRY = 3500;   // Value when sensor is in dry soil
+const int SOIL_WET = 1000;   // Value when sensor is in water
+const int soilThresholdPercent = 30; // Pump turns on if below this %
 const int pumpDurationSec = 10;
 const int minPumpIntervalMin = 30;
 const int maxPumpRunsPerDay = 20;
+
+// ===== LDR Calibration =====
+const int LDR_DARK = 500;     // Adjust after testing in dark
+const int LDR_BRIGHT = 3000;  // Adjust after testing in bright light
 
 // ===== Variables =====
 bool pumpState = false;
@@ -41,25 +47,54 @@ unsigned long pumpOnTime = 0;
 unsigned long lastWaterTime = 0;
 int pumpRunsToday = 0;
 
-// Manual override for toggle
+// Manual override
 bool manualOverride = false;
 unsigned long manualOverrideTime = 0;
-const unsigned long overrideDuration = 15000; // 15 seconds
-
-// For smooth LCD updates
-float lastTemp = -1000, lastHum = -1000, lastSoil = -1;
-int lastLDR = -1;
-bool lastPumpState = false;
+const unsigned long overrideDuration = 15000; // 15 sec
 
 // ===== Helper Functions =====
+
+// Convert raw soil reading to percent (0 = dry, 100 = wet)
 float soilRawToPercent(int raw) {
   int r = constrain(raw, SOIL_WET, SOIL_DRY);
-  float pct = 100.0 * (float)(r - SOIL_WET) / (float)(SOIL_DRY - SOIL_WET);
+  float pct = 100.0 * (float)(SOIL_DRY - r) / (float)(SOIL_DRY - SOIL_WET);
   return constrain(pct, 0.0, 100.0);
 }
 
+// Average soil readings for stability
+float readSoilPercent() {
+  const int samples = 5;
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(SOIL_PIN);
+    delay(10);
+  }
+  int avg = total / samples;
+  return soilRawToPercent(avg);
+}
+
+// Convert raw LDR reading to light percentage (0 = dark, 100 = bright)
+float ldrRawToPercent(int raw) {
+  int r = constrain(raw, LDR_DARK, LDR_BRIGHT);
+  float pct = 100.0 * (float)(r - LDR_DARK) / (float)(LDR_BRIGHT - LDR_DARK);
+  return constrain(pct, 0.0, 100.0);
+}
+
+// Average LDR readings for stability
+float readLightPercent() {
+  const int samples = 5;
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(LDR_PIN);
+    delay(10);
+  }
+  int avg = total / samples;
+  return ldrRawToPercent(avg);
+}
+
+// Pump control
 void setPump(bool on) {
-  digitalWrite(RELAY_PIN, on ? LOW : HIGH);  // Active-Low
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);  // Active-Low relay
   pumpState = on;
   if (on) {
     pumpOnTime = millis();
@@ -78,16 +113,16 @@ void handleRoot() {
 
 void handleJSON() {
   TempAndHumidity dhtData = dht.getTempAndHumidity();
-  float temp = !isnan(dhtData.temperature) ? dhtData.temperature : lastTemp;
-  float hum  = !isnan(dhtData.humidity) ? dhtData.humidity : lastHum;
-  float soilPct = soilRawToPercent(analogRead(SOIL_PIN));
-  int ldrVal = analogRead(LDR_PIN);
+  float temp = dhtData.temperature ;
+  float hum  = dhtData.humidity ;
+  float soilPct = readSoilPercent();
+  float lightPct = readLightPercent();
 
   String json = "{";
   json += "\"temperature\":" + String(temp, 1) + ",";
   json += "\"humidity\":" + String(hum, 1) + ",";
   json += "\"soil\":" + String(soilPct, 1) + ",";
-  json += "\"ldr\":" + String(ldrVal) + ",";
+  json += "\"light\":" + String(lightPct, 1) + ",";
   json += "\"pump\":" + String(pumpState ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
@@ -110,7 +145,6 @@ void setup() {
 
   // LCD
   lcd.init();
-  lcd.begin(LCD_COLUMNS, LCD_ROWS);
   lcd.backlight();
   lcd.setCursor(0,0);
   lcd.print("Plant Monitor");
@@ -121,7 +155,7 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);  // OFF at boot
 
-  // DHT Sensor
+  // DHT
   dht.setup(DHTPIN, DHTTYPE);
   Serial.println("DHT sensor initialized.");
 
@@ -159,64 +193,61 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  static unsigned long lastRead = 0;
-  if (millis() - lastRead > 3000) {
-    lastRead = millis();
+  // === 1-second loop interval ===
+  delay(1000);
 
-    // Read all sensors
-    TempAndHumidity dhtData = dht.getTempAndHumidity();
-    float temp = !isnan(dhtData.temperature) ? dhtData.temperature : lastTemp;
-    float hum  = !isnan(dhtData.humidity) ? dhtData.humidity : lastHum;
-    float soilPct = soilRawToPercent(analogRead(SOIL_PIN));
-    int ldrVal = analogRead(LDR_PIN);
+  // Read sensors
+  TempAndHumidity dhtData = dht.getTempAndHumidity();
+  float temp = !isnan(dhtData.temperature) ? dhtData.temperature : 0;
+  float hum  = !isnan(dhtData.humidity) ? dhtData.humidity : 0;
+  float soilPct = readSoilPercent();
+  float lightPct = readLightPercent();
 
-    Serial.printf("T=%.1fC H=%.1f%% Soil=%.1f%% LDR=%d Pump=%s\n",
-                  temp, hum, soilPct, ldrVal, pumpState?"ON":"OFF");
+  Serial.printf("T=%.1fC H=%.1f%% Soil=%.1f%% Light=%.1f%% Pump=%s\n",
+                temp, hum, soilPct, lightPct, pumpState ? "ON" : "OFF");
 
-    // LCD update
-    if (temp != lastTemp || hum != lastHum) {
-      lcd.setCursor(0,0);
-      lcd.print("T:");
-      lcd.print(temp,1);
-      lcd.print("C H:");
-      lcd.print(hum,0);
-      lcd.print("%  ");
-      lastTemp = temp;
-      lastHum = hum;
+  // === Reset LCD each loop ===
+  lcd.noDisplay();
+  delay(10); // brief pause before reset
+  lcd.display();
+  lcd.clear();
+
+  // LCD Line 1: Temperature & Humidity
+  lcd.setCursor(0,0);
+  lcd.print("T:");
+  lcd.print(temp,1);
+  lcd.print("C H:");
+  lcd.print(hum,0);
+  lcd.print("%");
+
+  // LCD Line 2: Soil, Light, Pump
+  lcd.setCursor(0,1);
+  lcd.print("S:");
+  lcd.print(soilPct,0);
+  lcd.print("% ");
+  lcd.print(lightPct < 30 ? "Dark" : "Light");
+  lcd.print(" ");
+  lcd.print(pumpState ? "ON" : "OFF");
+
+  // === Auto-watering logic ===
+  if (!pumpState && soilPct <= soilThresholdPercent) {
+    unsigned long sinceLast = millis() - lastWaterTime;
+    if (!manualOverride &&
+        sinceLast > (unsigned long)minPumpIntervalMin * 60000UL &&
+        pumpRunsToday < maxPumpRunsPerDay) {
+      Serial.println("Soil dry -> Pump ON");
+      setPump(true);
     }
+  }
 
-    if (soilPct != lastSoil || ldrVal != lastLDR || pumpState != lastPumpState) {
-      lcd.setCursor(0,1);
-      lcd.print("S:");
-      lcd.print(soilPct,0);
-      lcd.print("% L:");
-      lcd.print(ldrVal);
-      lcd.print(pumpState?"ON ":"OFF");
-      lastSoil = soilPct;
-      lastLDR = ldrVal;
-      lastPumpState = pumpState;
-    }
+  // Turn off pump after duration
+  if (pumpState && millis() - pumpOnTime >= pumpDurationSec * 1000UL) {
+    setPump(false);
+    Serial.println("Pump OFF after duration");
+  }
 
-    // Auto-watering logic
-    if (!pumpState && soilPct >= soilThresholdPercent) {
-      unsigned long sinceLast = millis() - lastWaterTime;
-      if (!manualOverride &&
-          sinceLast > (unsigned long)minPumpIntervalMin * 60000UL &&
-          pumpRunsToday < maxPumpRunsPerDay) {
-        Serial.println("Soil dry -> Pump ON");
-        setPump(true);
-      }
-    }
-
-    // Turn off pump after duration
-    if (pumpState && millis() - pumpOnTime >= pumpDurationSec * 1000UL) {
-      setPump(false);
-      Serial.println("Pump OFF after duration");
-    }
-
-    // Reset manual override
-    if (manualOverride && millis() - manualOverrideTime > overrideDuration) {
-      manualOverride = false;
-    }
+  // Reset manual override
+  if (manualOverride && millis() - manualOverrideTime > overrideDuration) {
+    manualOverride = false;
   }
 }
